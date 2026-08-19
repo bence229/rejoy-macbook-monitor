@@ -5,24 +5,43 @@ on:
   schedule:
     - cron: "*/10 * * * *"
 
+permissions:
+  contents: write
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Repository letöltése
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Python beállítása
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Függőségek telepítése
+        run: |
+          pip install -r requirements.txt
 
-      - name: Run monitor
+      - name: Rejoy ellenőrzése
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python monitor.py
+        run: |
+          python monitor.py
+
+      - name: Állapot mentése
+        run: |
+          git config user.name "Rejoy MacBook Monitor"
+          git config user.email "rejoy-monitor@users.noreply.github.com"
+
+          git add seen_products.json
+
+          if git diff --cached --quiet; then
+            echo "Nincs új állapotváltozás."
+          else
+            git commit -m "Update Rejoy monitor state"
+            git push
+          fi
