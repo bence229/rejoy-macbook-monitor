@@ -15,12 +15,11 @@ STATE_FILE = "seen_products.json"
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# Szándékosan csak néhány listaoldalt nézünk meg.
-# A korábbi 20 oldal túl sok kérés volt és 429-et okozott.
+# Egyelőre csak 2 oldalt nézünk.
+# Így kisebb az esélye a Rejoy 429-es korlátozásának.
 PAGES_TO_CHECK = 2
 
-# Két listaoldal között várunk egy kicsit,
-# hogy ne terheljük túl a Rejoy szerverét.
+# A két listaoldal között várunk 5 másodpercet.
 DELAY_BETWEEN_PAGES = 5
 
 HEADERS = {
@@ -33,7 +32,9 @@ HEADERS = {
         "text/html,application/xhtml+xml,application/xml;"
         "q=0.9,image/avif,image/webp,*/*;q=0.8"
     ),
-    "Accept-Language": "hu-HU,hu;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Language": (
+        "hu-HU,hu;q=0.9,en-US;q=0.8,en;q=0.7"
+    ),
     "Cache-Control": "no-cache",
 }
 
@@ -48,6 +49,7 @@ class LinkParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         if tag == "a":
             attributes = dict(attrs)
+
             self.current_href = attributes.get("href")
             self.current_text = []
 
@@ -57,10 +59,15 @@ class LinkParser(HTMLParser):
 
     def handle_endtag(self, tag):
         if tag == "a" and self.current_href:
-            text = " ".join(self.current_text).strip()
+            text = " ".join(
+                self.current_text
+            ).strip()
 
             self.links.append(
-                (self.current_href, text)
+                (
+                    self.current_href,
+                    text,
+                )
             )
 
             self.current_href = None
@@ -75,7 +82,9 @@ def get(url):
     )
 
     if response.status_code == 429:
-        retry_after = response.headers.get("Retry-After")
+        retry_after = response.headers.get(
+            "Retry-After"
+        )
 
         print(
             "REJOY 429 Too Many Requests."
@@ -87,7 +96,8 @@ def get(url):
             )
 
         raise RuntimeError(
-            "A Rejoy ideiglenesen korlátozta a lekérést."
+            "A Rejoy ideiglenesen korlátozta "
+            "a lekérést."
         )
 
     response.raise_for_status()
@@ -132,47 +142,55 @@ def is_target_product(url, text):
     - MacBook Air 13"
     - M3 vagy M4
     - 16 GB RAM
-    - 256 vagy 512 GB
+    - 256 vagy 512 GB tárhely
     """
 
-    combined = (
-        f"{url} {text}"
-    ).lower()
+    combined = f"{url} {text}".lower()
 
-    # MacBook Air 13"
-    if "macbook air 13" not in combined:
+    # A Rejoy URL-ekben a szavak gyakran
+    # kötőjellel vannak elválasztva:
+    #
+    # macbook-air-13
+    # 16-gb
+    # 256gb
+    #
+    # Ezért ezeket egységes formára alakítjuk.
+
+    normalized = re.sub(
+        r"[-_/]+",
+        " ",
+        combined,
+    )
+
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        normalized,
+    ).strip()
+
+    # MacBook Air 13
+    if "macbook air 13" not in normalized:
         return False
 
     # M3 vagy M4
-    has_m3 = re.search(
-        r"\bm3\b|[-_]m3[-_]",
-        combined,
-    )
-
-    has_m4 = re.search(
-        r"\bm4\b|[-_]m4[-_]",
-        combined,
-    )
-
-    if not has_m3 and not has_m4:
+    if not re.search(
+        r"\bm3\b|\bm4\b",
+        normalized,
+    ):
         return False
 
     # 16 GB RAM
-    if "16 gb" not in combined:
+    if not re.search(
+        r"\b16\s*gb\b",
+        normalized,
+    ):
         return False
 
-    # 256 vagy 512 GB
-    has_256 = (
-        "256 gb" in combined
-        or "256gb" in combined
-    )
-
-    has_512 = (
-        "512 gb" in combined
-        or "512gb" in combined
-    )
-
-    if not has_256 and not has_512:
+    # 256 vagy 512 GB tárhely
+    if not re.search(
+        r"\b(256|512)\s*gb\b",
+        normalized,
+    ):
         return False
 
     return True
@@ -182,9 +200,8 @@ def find_available_products():
     """
     A Rejoy Apple laptop-listáját nézzük.
 
-    Fontos:
-    nem kérjük le külön a termékoldalakat.
-    Ez jelentősen csökkenti a HTTP kérések számát,
+    Nem kérjük le külön a termékoldalakat.
+    Ez csökkenti a HTTP kérések számát,
     így kisebb az esélye a 429-es blokkolásnak.
     """
 
@@ -212,15 +229,15 @@ def find_available_products():
                 f"Listaoldal hiba: {error}"
             )
 
-            # Ha nem tudtuk ellenőrizni az oldalt,
-            # inkább megszakítjuk a teljes ellenőrzést.
-            # Így nem írjuk felül tévesen az előző állapotot.
+            # Sikertelen ellenőrzésnél
+            # nem folytatjuk téves állapotmentéssel.
             raise
 
         parser = LinkParser()
         parser.feed(html)
 
         for href, text in parser.links:
+
             if not href:
                 continue
 
@@ -231,22 +248,23 @@ def find_available_products():
 
             lower_url = full_url.lower()
 
-            # Csak Rejoy Apple termékoldal.
+            # Csak Rejoy Apple termékoldalak.
             if "/shop/apple/" not in lower_url:
                 continue
 
+            # Csak a kívánt MacBookokat engedjük át.
             if not is_target_product(
                 full_url,
                 text,
             ):
                 continue
 
-            # A listázóoldalon szereplő terméket
-            # jelenleg elérhetőnek tekintjük.
-            candidates[full_url] = (
+            title = (
                 text.strip()
                 or "MacBook Air 13"
             )
+
+            candidates[full_url] = title
 
         if page < PAGES_TO_CHECK:
             time.sleep(
@@ -276,9 +294,15 @@ def send_telegram(message):
 
 
 def main():
-    print("===================================")
-    print("REJOY MACBOOK MONITOR")
-    print("===================================")
+    print(
+        "==================================="
+    )
+    print(
+        "REJOY MACBOOK MONITOR"
+    )
+    print(
+        "==================================="
+    )
 
     old_state = load_state()
 
@@ -292,14 +316,13 @@ def main():
         )
         print(error)
 
-        # Nagyon fontos:
-        # sikertelen ellenőrzésnél NEM mentjük el
-        # az üres/hiányos állapotot.
+        # Hiba esetén NEM írjuk át
+        # a korábbi állapotot.
         return
 
     print()
     print(
-        f"Megtalált megfelelő készleten lévő "
+        "Megtalált megfelelő készleten lévő "
         f"termékek: {len(products)}"
     )
 
@@ -310,13 +333,18 @@ def main():
         print(url)
         print()
 
+    # Az aktuális készleten lévő termékek
+    # állapotát mentjük.
     current_state = {
         url: True
         for url in products
     }
 
     # Első sikeres futás:
-    # csak elmentjük az állapotot.
+    # csak elmentjük az aktuális állapotot.
+    #
+    # Így nem kapunk Telegramot olyan gépre,
+    # ami már az első ellenőrzéskor készleten volt.
     if old_state is None:
         save_state(current_state)
 
@@ -334,9 +362,11 @@ def main():
 
     new_products = []
 
-    # Az újonnan megjelent / újra készleten lévő
-    # termékeket keressük.
+    # Megkeressük azokat a gépeket,
+    # amelyek korábban nem voltak készleten,
+    # most pedig igen.
     for url, title in products.items():
+
         was_available = old_state.get(
             url,
             False,
@@ -344,10 +374,13 @@ def main():
 
         if not was_available:
             new_products.append(
-                (url, title)
+                (
+                    url,
+                    title,
+                )
             )
 
-    # Az aktuális állapot mentése.
+    # Aktuális állapot mentése.
     save_state(current_state)
 
     if not new_products:
@@ -358,11 +391,12 @@ def main():
 
     print()
     print(
-        f"ÚJ megfelelő készülékek: "
+        "ÚJ megfelelő készülékek: "
         f"{len(new_products)}"
     )
 
     for url, title in new_products:
+
         message = (
             "🚨 ÚJ REJOY MACBOOK! 🚨\n\n"
             f"{title}\n\n"
