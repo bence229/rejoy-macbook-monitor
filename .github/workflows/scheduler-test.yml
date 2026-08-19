@@ -1,0 +1,13 @@
+name: Scheduler Test
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scheduler működik
+        run: echo "A scheduler működik."
