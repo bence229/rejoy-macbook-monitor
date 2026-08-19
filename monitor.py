@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from html.parser import HTMLParser
 from urllib.parse import urljoin
 
@@ -8,17 +9,32 @@ import requests
 
 
 REJOY_BASE = "https://rejoy.hu"
+REJOY_LIST_URL = "https://rejoy.hu/laptop/apple/?page={page}"
 STATE_FILE = "seen_products.json"
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+
+# Szándékosan csak néhány listaoldalt nézünk meg.
+# A korábbi 20 oldal túl sok kérés volt és 429-et okozott.
+PAGES_TO_CHECK = 2
+
+# Két listaoldal között várunk egy kicsit,
+# hogy ne terheljük túl a Rejoy szerverét.
+DELAY_BETWEEN_PAGES = 5
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/139.0 Safari/537.36"
-    )
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "hu-HU,hu;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
 }
 
 
@@ -42,7 +58,11 @@ class LinkParser(HTMLParser):
     def handle_endtag(self, tag):
         if tag == "a" and self.current_href:
             text = " ".join(self.current_text).strip()
-            self.links.append((self.current_href, text))
+
+            self.links.append(
+                (self.current_href, text)
+            )
+
             self.current_href = None
             self.current_text = []
 
@@ -53,7 +73,25 @@ def get(url):
         headers=HEADERS,
         timeout=30,
     )
+
+    if response.status_code == 429:
+        retry_after = response.headers.get("Retry-After")
+
+        print(
+            "REJOY 429 Too Many Requests."
+        )
+
+        if retry_after:
+            print(
+                f"Retry-After: {retry_after}"
+            )
+
+        raise RuntimeError(
+            "A Rejoy ideiglenesen korlátozta a lekérést."
+        )
+
     response.raise_for_status()
+
     return response.text
 
 
@@ -62,14 +100,23 @@ def load_state():
         return None
 
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8",
+        ) as f:
             return json.load(f)
+
     except Exception:
         return None
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    with open(
+        STATE_FILE,
+        "w",
+        encoding="utf-8",
+    ) as f:
         json.dump(
             state,
             f,
@@ -78,19 +125,97 @@ def save_state(state):
         )
 
 
-def find_candidate_products():
-    candidates = set()
+def is_target_product(url, text):
+    """
+    Csak ezek érdekelnek:
 
-    # A Rejoy laptop-lista több oldalon keresztül lapozható.
-    # 20 oldal bőven lefedi a jelenlegi laptopkínálatot.
-    for page in range(1, 21):
-        url = f"{REJOY_BASE}/shop/?page={page}"
+    - MacBook Air 13"
+    - M3 vagy M4
+    - 16 GB RAM
+    - 256 vagy 512 GB
+    """
+
+    combined = (
+        f"{url} {text}"
+    ).lower()
+
+    # MacBook Air 13"
+    if "macbook air 13" not in combined:
+        return False
+
+    # M3 vagy M4
+    has_m3 = re.search(
+        r"\bm3\b|[-_]m3[-_]",
+        combined,
+    )
+
+    has_m4 = re.search(
+        r"\bm4\b|[-_]m4[-_]",
+        combined,
+    )
+
+    if not has_m3 and not has_m4:
+        return False
+
+    # 16 GB RAM
+    if "16 gb" not in combined:
+        return False
+
+    # 256 vagy 512 GB
+    has_256 = (
+        "256 gb" in combined
+        or "256gb" in combined
+    )
+
+    has_512 = (
+        "512 gb" in combined
+        or "512gb" in combined
+    )
+
+    if not has_256 and not has_512:
+        return False
+
+    return True
+
+
+def find_available_products():
+    """
+    A Rejoy Apple laptop-listáját nézzük.
+
+    Fontos:
+    nem kérjük le külön a termékoldalakat.
+    Ez jelentősen csökkenti a HTTP kérések számát,
+    így kisebb az esélye a 429-es blokkolásnak.
+    """
+
+    candidates = {}
+
+    for page in range(
+        1,
+        PAGES_TO_CHECK + 1,
+    ):
+        url = REJOY_LIST_URL.format(
+            page=page
+        )
+
+        print()
+        print(
+            f"Rejoy listaoldal ellenőrzése: "
+            f"{page}/{PAGES_TO_CHECK}"
+        )
 
         try:
             html = get(url)
+
         except Exception as error:
-            print(f"Listaoldal hiba ({page}): {error}")
-            continue
+            print(
+                f"Listaoldal hiba: {error}"
+            )
+
+            # Ha nem tudtuk ellenőrizni az oldalt,
+            # inkább megszakítjuk a teljes ellenőrzést.
+            # Így nem írjuk felül tévesen az előző állapotot.
+            raise
 
         parser = LinkParser()
         parser.feed(html)
@@ -99,68 +224,36 @@ def find_candidate_products():
             if not href:
                 continue
 
-            full_url = urljoin(REJOY_BASE, href)
-            lower = full_url.lower()
+            full_url = urljoin(
+                REJOY_BASE,
+                href,
+            )
 
-            # Csak MacBook Air 13 termékoldalak.
-            if "/shop/apple/" not in lower:
+            lower_url = full_url.lower()
+
+            # Csak Rejoy Apple termékoldal.
+            if "/shop/apple/" not in lower_url:
                 continue
 
-            if "macbook-air-13" not in lower:
-                continue
-
-            # Csak M3 vagy M4.
-            if not re.search(r"-m3-|[-_]m3[-_]", lower) and not re.search(
-                r"-m4-|[-_]m4[-_]", lower
+            if not is_target_product(
+                full_url,
+                text,
             ):
                 continue
 
-            # Csak 16 GB.
-            if "16-gb" not in lower:
-                continue
+            # A listázóoldalon szereplő terméket
+            # jelenleg elérhetőnek tekintjük.
+            candidates[full_url] = (
+                text.strip()
+                or "MacBook Air 13"
+            )
 
-            # Csak 256 vagy 512 GB.
-            if "256gb" not in lower and "512gb" not in lower:
-                continue
+        if page < PAGES_TO_CHECK:
+            time.sleep(
+                DELAY_BETWEEN_PAGES
+            )
 
-            candidates.add(full_url)
-
-    return sorted(candidates)
-
-
-def product_is_available(html):
-    text = re.sub(r"\s+", " ", html)
-
-    # Ha ezt látjuk, biztosan kifogyott.
-    if "Tudni szeretném mikor lesz ismét raktáron!" in text:
-        return False
-
-    # Készleten lévő Rejoy-termék.
-    if "Kosárba" in text:
-        return True
-
-    return False
-
-
-def get_product_title(html):
-    parser = LinkParser()
-    parser.feed(html)
-
-    # Megpróbáljuk a <title> tartalmát kinyerni egyszerű regexszel.
-    match = re.search(
-        r"<title[^>]*>(.*?)</title>",
-        html,
-        re.IGNORECASE | re.DOTALL,
-    )
-
-    if match:
-        title = re.sub(r"<.*?>", "", match.group(1))
-        title = re.sub(r"\s+", " ", title).strip()
-
-        if title:
-            return title
-
-    return "MacBook Air 13"
+    return candidates
 
 
 def send_telegram(message):
@@ -189,103 +282,112 @@ def main():
 
     old_state = load_state()
 
-    candidates = find_candidate_products()
+    try:
+        products = find_available_products()
 
+    except Exception as error:
+        print()
+        print(
+            "Az ellenőrzés nem sikerült."
+        )
+        print(error)
+
+        # Nagyon fontos:
+        # sikertelen ellenőrzésnél NEM mentjük el
+        # az üres/hiányos állapotot.
+        return
+
+    print()
     print(
-        f"Megtalált megfelelő termékoldalak: "
-        f"{len(candidates)}"
+        f"Megtalált megfelelő készleten lévő "
+        f"termékek: {len(products)}"
     )
 
-    current_state = {}
+    for url, title in products.items():
+        print(
+            f"KÉSZLETEN: {title}"
+        )
+        print(url)
+        print()
 
-    for url in candidates:
-        try:
-            html = get(url)
-            available = product_is_available(html)
+    current_state = {
+        url: True
+        for url in products
+    }
 
-            current_state[url] = available
-
-            status = "KÉSZLETEN" if available else "NINCS KÉSZLETEN"
-
-            print(f"{status}: {url}")
-
-        except Exception as error:
-            print(f"Hiba: {url}")
-            print(error)
-
-    # ELSŐ FUTÁS:
-    #
-    # Felvesszük az aktuális állapotot, de NEM küldünk
-    # értesítést a már most meglévő gépekről.
+    # Első sikeres futás:
+    # csak elmentjük az állapotot.
     if old_state is None:
         save_state(current_state)
 
-        print()
         print(
-            "Első futás: az aktuális készletet elmentettem."
+            "Első sikeres futás."
         )
         print(
-            "Most nem küldök Telegram értesítést."
+            "Az aktuális készlet elmentve."
         )
         print(
-            "A következő futásoktól az újonnan megjelenő "
-            "gépeket fogom jelezni."
+            "Telegram értesítést most nem küldök."
         )
 
         return
 
     new_products = []
 
-    for url, available_now in current_state.items():
-        available_before = old_state.get(url, False)
+    # Az újonnan megjelent / újra készleten lévő
+    # termékeket keressük.
+    for url, title in products.items():
+        was_available = old_state.get(
+            url,
+            False,
+        )
 
-        # Ez a fontos feltétel:
-        #
-        # korábban NEM volt készleten
-        # most pedig KÉSZLETEN van.
-        #
-        # Vagy teljesen új termékoldal jelent meg.
-        if available_now and not available_before:
-            new_products.append(url)
+        if not was_available:
+            new_products.append(
+                (url, title)
+            )
 
+    # Az aktuális állapot mentése.
     save_state(current_state)
 
     if not new_products:
-        print("Nincs új megfelelő MacBook.")
+        print(
+            "Nincs új megfelelő MacBook."
+        )
         return
 
+    print()
     print(
-        f"Új megfelelő készülékek: "
+        f"ÚJ megfelelő készülékek: "
         f"{len(new_products)}"
     )
 
-    for url in new_products:
+    for url, title in new_products:
+        message = (
+            "🚨 ÚJ REJOY MACBOOK! 🚨\n\n"
+            f"{title}\n\n"
+            "✅ MacBook Air 13″\n"
+            "✅ M3 vagy M4\n"
+            "✅ 16 GB RAM\n"
+            "✅ 256 vagy 512 GB\n"
+            "✅ Jelenleg készleten\n\n"
+            "🛒 TERMÉK MEGNYITÁSA:\n"
+            f"{url}"
+        )
+
         try:
-            html = get(url)
-            title = get_product_title(html)
-
-            message = (
-                "🚨 ÚJ REJOY MACBOOK! 🚨\n\n"
-                f"{title}\n\n"
-                "✅ MacBook Air 13″\n"
-                "✅ M3 vagy M4\n"
-                "✅ 16 GB RAM\n"
-                "✅ 256 vagy 512 GB\n"
-                "✅ Jelenleg készleten\n\n"
-                "🛒 TERMÉK MEGNYITÁSA:\n"
-                f"{url}"
-            )
-
             send_telegram(message)
 
             print(
-                f"Telegram értesítés elküldve: {url}"
+                "Telegram értesítés elküldve:"
             )
+            print(url)
 
         except Exception as error:
             print(
-                f"Telegram küldési hiba: {error}"
+                "Telegram küldési hiba:"
             )
+            print(error)
 
 
 if __name__ == "__main__":
